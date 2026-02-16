@@ -16323,11 +16323,10 @@ async def pvb_decision_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Not your game!", show_alert=True)
         return
 
-    # Retrieve game from context or memory
-    # Note: We rely on game_sessions for persistent state
-    game = game_sessions.get(game_id)
+    # Retrieve game from game_sessions
+    match_data = game_sessions.get(game_id)
     
-    if not game or game['status'] != 'active':
+    if not match_data or match_data['status'] != 'active':
         await query.answer("Game expired or finished.", show_alert=True)
         return
 
@@ -16336,10 +16335,10 @@ async def pvb_decision_callback(update: Update, context: ContextTypes.DEFAULT_TY
         amount = float(parts[4]) if len(parts) > 4 else 0
         
         user_wallets[user.id] += amount
-        game['status'] = 'completed'
-        game['win'] = True # Technical win for stats
+        match_data['status'] = 'completed'
+        match_data['win'] = True # Technical win for stats
         
-        update_stats_on_bet(user.id, game_id, game['bet_amount'], True, multiplier=(amount/game['bet_amount']), context=context)
+        update_stats_on_bet(user.id, game_id, match_data['bet_amount'], True, multiplier=(amount/match_data['bet_amount']), context=context)
         update_pnl(user.id)
         save_user_data(user.id)
         
@@ -16350,26 +16349,100 @@ async def pvb_decision_callback(update: Update, context: ContextTypes.DEFAULT_TY
             query,
             f"💰 <b>Cashed Out!</b>\n\n"
             f"You took the offer: <b>${amount:.2f}</b>\n"
-            f"Bot Score was: {sum(game.get('bot_rolls', []))}\n"
+            f"Bot Score was: {sum(match_data.get('bot_rolls', []))}\n"
             f"Game Over.",
             parse_mode=ParseMode.HTML
         )
         
     elif action == "roll":
-        # Continue Game - Prompt user to roll
-        expected_emoji = "🎲" # Derive from game type
-        if "dart" in game['game_type']: expected_emoji = "🎯"
-        elif "goal" in game['game_type']: expected_emoji = "⚽"
-        elif "bowl" in game['game_type']: expected_emoji = "🎳"
+        # User chose to continue - Calculate round result
+        players = match_data['players']
+        p1, p2 = players
+        p1_rolls = match_data["player_rolls"].get(p1, [])
+        p2_rolls = match_data["player_rolls"].get(p2, [])
+        game_mode = match_data['game_mode']
         
-        rolls = game['game_rolls']
+        # Calculate totals
+        p1_total = sum(p1_rolls)
+        p2_total = sum(p2_rolls)
+        
+        p1_rolls_text = " + ".join(str(r) for r in p1_rolls)
+        p2_rolls_text = " + ".join(str(r) for r in p2_rolls)
+        
+        text = f"<b>Round Results:</b>\n"
+        text += f"{match_data['usernames'][p1]}: {p1_rolls_text} = <b>{p1_total}</b>\n"
+        text += f"{match_data['usernames'][p2]}: {p2_rolls_text} = <b>{p2_total}</b>\n\n"
+        
+        winner_id, extra_info = None, ""
+        
+        # Determine winner based on mode
+        if game_mode == "normal":
+            if p1_total > p2_total:
+                winner_id = p1
+            elif p2_total > p1_total:
+                winner_id = p2
+            else:
+                extra_info = "🤝 It's a tie! No points this round."
+        else:  # Crazy mode
+            if p1_total < p2_total:
+                winner_id = p1
+            elif p2_total < p1_total:
+                winner_id = p2
+            else:
+                extra_info = "🤝 It's a tie! No points this round."
+
+        if winner_id is not None:
+            match_data["points"][winner_id] += 1
+            text += f"🎉 {match_data['usernames'][winner_id]} wins this round!"
+        else:
+            text += extra_info
+
+        text += f"\n\n<b>Score:</b> {match_data['usernames'][p1]} {match_data['points'][p1]} - {match_data['points'][p2]} {match_data['usernames'][p2]}"
+
+        target = match_data["target_points"]
+        final_winner = None
+        if match_data["points"][p1] >= target: final_winner = p1
+        elif match_data["points"][p2] >= target: final_winner = p2
+
+        if final_winner is not None:
+            loser_id = p2 if final_winner == p1 else p1
+            match_data.update({"status": "completed", "winner_id": final_winner})
+            
+            bet_amount = match_data.get("bet_amount_usd", match_data.get("bet_amount", 0))
+            winnings = bet_amount * 1.94
+            
+            # Credit winner (only if not bot)
+            if final_winner != 0:
+                user_wallets[final_winner] += winnings
+                update_stats_on_bet(final_winner, game_id, bet_amount, True, pvp_win=True, multiplier=1.94, context=context)
+                update_pnl(final_winner)
+                save_user_data(final_winner)
+            
+            # Update loser stats (only if not bot)
+            if loser_id != 0:
+                update_stats_on_bet(loser_id, game_id, bet_amount, False, context=context)
+                update_pnl(loser_id)
+                save_user_data(loser_id)
+            
+            text += f"\n\n🏆 <b>{match_data['usernames'][final_winner]} wins the match and earns ${winnings:.2f}!</b>"
+            
+            # Cleanup
+            if user.id in active_pvb_games:
+                del active_pvb_games[user.id]
+        else:
+            # Continue to next round
+            match_data["last_roller"] = None
+            match_data["player_rolls"] = {p1: [], p2: []}
+            
+            allowed_emojis = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
+            gtype = match_data['game_type']
+            text += f"\n\n<b>Next round:</b> {match_data['usernames'][p1]} rolls first! ({allowed_emojis.get(gtype, '🎲')} emoji)"
+
         await safe_edit_message(
             query,
-            f"🎲 <b>Your Turn!</b>\n\n"
-            f"Send {rolls} {expected_emoji} to finish the game!",
+            text,
             parse_mode=ParseMode.HTML
         )
-        # The existing message_listener will catch the dice sent by user
 
 
 async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TYPE, game_type: str, target_score: int):
