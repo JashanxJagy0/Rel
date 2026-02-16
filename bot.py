@@ -13,6 +13,7 @@ import secrets # For secure token generation
 import hashlib # For hashing PINs
 import hmac # For secure key derivation
 import traceback # For detailed error logging
+import itertools # For PvB cashout probability calculations
 
 # Suppress PTB warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -4274,6 +4275,59 @@ def set_menu_owner(message, user_id):
         for key in keys_to_remove:
             del bot_settings['menu_owners'][key]
 
+def calculate_pvb_cashout(bot_total, user_rolls_left, game_type, game_mode, bet_amount, target_score):
+    """
+    Calculates fair cashout based on probability of user winning.
+    
+    Args:
+        bot_total: Total score rolled by the bot
+        user_rolls_left: Number of remaining rolls for the user
+        game_type: Type of game (dice, darts, goal, bowl, etc.)
+        game_mode: Game mode ('normal' for highest wins, 'crazy' for lowest wins)
+        bet_amount: The amount bet on this game
+        target_score: Target score (currently unused, reserved for future extensions)
+    
+    Returns: (Win_Probability, Cashout_Amount)
+    """
+    # 1. Determine Dice Range
+    # Dice, Darts, Bowling = 1-6
+    # Football, Basketball = 1-5
+    if 'goal' in game_type or 'football' in game_type or 'basket' in game_type:
+        die_range = range(1, 6) # 1-5
+    else:
+        die_range = range(1, 7) # 1-6
+        
+    outcomes = list(itertools.product(die_range, repeat=user_rolls_left))
+    total_outcomes = len(outcomes)
+    wins = 0
+    ties = 0
+    
+    for outcome in outcomes:
+        user_total = sum(outcome)
+        
+        if game_mode == "normal": # Highest wins
+            if user_total > bot_total: wins += 1
+            elif user_total == bot_total: ties += 1
+        else: # Crazy mode (Lowest wins)
+            if user_total < bot_total: wins += 1
+            elif user_total == bot_total: ties += 1
+            
+    win_prob = wins / total_outcomes
+    tie_prob = ties / total_outcomes
+    
+    # Potential payout is 2x (minus small fee usually, but let's assume 2x pot)
+    # Cashout formula: (Win% * 2.0 + Tie% * 1.0) * Bet * (1 - House_Edge)
+    # House edge for cashout = 5%
+    expected_value_multiplier = (win_prob * 2.0) + (tie_prob * 1.0)
+    cashout_offer = bet_amount * expected_value_multiplier * 0.95
+    
+    # Sanity checks
+    # Cap at 95% of 2x to ensure house always has edge (max 1.9x bet_amount)
+    if cashout_offer > (bet_amount * 1.9): cashout_offer = bet_amount * 1.9
+    if cashout_offer < 0: cashout_offer = 0
+    
+    return win_prob, cashout_offer
+
 def get_locked_balance_in_games(user_id: int) -> dict:
     """
     Calculate total locked balance in active games and provide breakdown by game type.
@@ -7840,18 +7894,15 @@ def create_tower_game_visual(game):
 
 
 async def handle_tower_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, game_id: str, game: dict, position: int):
-    """Handle tile selection"""
+    """Handle tile selection in Tower game"""
     query = update.callback_query
     user = query.from_user
-    
     current_floor = game["current_floor"]
     snake_position = game["tower_config"][current_floor]
     difficulty = game["difficulty"]
-    tiles_per_floor = game["tiles_per_floor"]
     
-    # Check if hit snake
     if position == snake_position:
-        # Game over - hit snake
+        # --- LOSS ---
         game["status"] = 'completed'
         game["win"] = False
         game["selected_tiles"].append(position)
@@ -7859,134 +7910,119 @@ async def handle_tower_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         update_stats_on_bet(user.id, game_id, game["bet_amount"], False, context=context)
         update_pnl(user.id)
         save_user_data(user.id)
+        store_provably_fair_record(game_id, "tower", game["server_seed"], game["client_seed"], game["nonce"], result_data=f"Hit snake floor {current_floor}")
         
-        # Store provably fair record
-        store_provably_fair_record(game_id, "tower", game["server_seed"], game["client_seed"], game["nonce"], 
-                                   result_data=f"Hit snake on floor {current_floor + 1}, Config: {game['tower_config']}")
-        
-        # Answer the callback query first
         await query.answer("💔 You hit the snake!")
         
-        # Build keyboard showing revealed board with all snakes
+        # FIX: Explicitly convert tuple to list
         keyboard_markup = build_tower_keyboard(game)
-        # Add provably fair button
-        keyboard = keyboard_markup.inline_keyboard
+        keyboard = list(keyboard_markup.inline_keyboard) 
+        
+        # Add buttons
+        replay_row = [
+            InlineKeyboardButton("🔄 Play Again", callback_data=f"tower_again_{game_id}_{user.id}"),
+            InlineKeyboardButton("2️⃣ Double", callback_data=f"tower_double_{game_id}_{user.id}")
+        ]
+        keyboard.append(replay_row)
         keyboard.append([await create_provably_fair_button(game_id, context)])
         
-        await query.edit_message_text(
-            f"🐍 <b>Tower Collapsed!</b>\n"
-            f"ID: <code>{game_id}</code>\n\n"
-            f"💔 You hit the snake on Floor {current_floor + 1}!\n"
-            f"💸 Lost: ${game['bet_amount']:.2f}\n"
-            f"🏗️ Floors climbed: {current_floor}/9",
+        await safe_edit_message(
+            query,
+            f"🐍 <b>Tower Collapsed!</b>\nID: <code>{game_id}</code>\n\n💔 Snake hit on Floor {current_floor + 1}!\n💸 Lost: ${game['bet_amount']:.2f}\n🏗️ Floors: {current_floor}/9",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        return
-    
-    # Safe tile - advance to next floor
-    game["selected_tiles"].append(position)
-    game["current_floor"] += 1
-    new_floor = game["current_floor"]
-    
-    # Check if completed all 9 floors
-    if new_floor >= 9:
-        multiplier = TOWER_MULTIPLIERS[difficulty][9]
-        winnings = game["bet_amount"] * multiplier
-        user_wallets[user.id] += winnings
-        game["status"] = 'completed'
-        game["win"] = True
-        game["multiplier"] = multiplier
-        increment_user_nonce(user.id)
-        update_stats_on_bet(user.id, game_id, game["bet_amount"], True, multiplier=multiplier, context=context)
-        update_pnl(user.id)
-        save_user_data(user.id)
+    else:
+        # --- SAFE ---
+        game["selected_tiles"].append(position)
+        game["current_floor"] += 1
+        new_floor = game["current_floor"]
         
-        # Store provably fair record
-        store_provably_fair_record(game_id, "tower", game["server_seed"], game["client_seed"], game["nonce"], 
-                                   result_data=f"Conquered all floors, Multiplier: {multiplier}x, Config: {game['tower_config']}")
-        
-        # Answer the callback query first
-        await query.answer("🏆 Tower conquered!")
-        
-        # Build keyboard showing revealed board
-        keyboard_markup = build_tower_keyboard(game)
-        # Add provably fair button
-        keyboard = keyboard_markup.inline_keyboard
-        keyboard.append([await create_provably_fair_button(game_id, context)])
-        
-        await query.edit_message_text(
-            f"🏆 <b>Tower Conquered!</b>\n"
-            f"ID: <code>{game_id}</code>\n\n"
-            f"🎉 YOU REACHED THE TOP!\n"
-            f"💰 Winnings: <b>${winnings:.2f}</b>\n"
-            f"📈 Final Multiplier: {multiplier}x\n"
-            f"🏗️ All 9 floors completed!",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    # Continue to next floor
-    multiplier = TOWER_MULTIPLIERS[difficulty][new_floor]
-    potential_winnings = game["bet_amount"] * multiplier
-    
-    # Answer the callback query
-    await query.answer("✅ Safe tile!")
-    
-    # Build keyboard for next floor
-    keyboard = build_tower_keyboard(game)
-    
-    await query.edit_message_text(
-        f"✅ <b>Safe! Climbing up...</b>\n"
-        f"ID: <code>{game_id}</code>\n\n"
-        f"📊 Floor: {new_floor}/9\n"
-        f"💰 Current Value: <b>${potential_winnings:.2f}</b>\n"
-        f"📈 Multiplier: {multiplier}x\n\n"
-        f"Choose your next tile or cash out!",
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard
-    )
+        if new_floor >= 9:
+            # --- AUTO WIN (TOP REACHED) ---
+            multiplier = TOWER_MULTIPLIERS[difficulty][9]
+            winnings = game["bet_amount"] * multiplier
+            user_wallets[user.id] += winnings
+            game["status"] = 'completed'
+            game["win"] = True
+            game["multiplier"] = multiplier
+            increment_user_nonce(user.id)
+            update_stats_on_bet(user.id, game_id, game["bet_amount"], True, multiplier=multiplier, context=context)
+            update_pnl(user.id)
+            save_user_data(user.id)
+            
+            await query.answer("🏆 Top Reached!")
+            
+            # FIX: Explicitly convert tuple to list
+            keyboard_markup = build_tower_keyboard(game)
+            keyboard = list(keyboard_markup.inline_keyboard)
+            
+            replay_row = [
+                InlineKeyboardButton("🔄 Play Again", callback_data=f"tower_again_{game_id}_{user.id}"),
+                InlineKeyboardButton("2️⃣ Double", callback_data=f"tower_double_{game_id}_{user.id}")
+            ]
+            keyboard.append(replay_row)
+            keyboard.append([await create_provably_fair_button(game_id, context)])
+            
+            await safe_edit_message(
+                query,
+                f"🏆 <b>Tower Conquered!</b>\nID: <code>{game_id}</code>\n\n🎉 <b>WIN: ${winnings:.2f}</b>\n📈 Multiplier: {multiplier}x",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            # --- CONTINUE CLIMBING ---
+            multiplier = TOWER_MULTIPLIERS[difficulty][new_floor]
+            potential = game["bet_amount"] * multiplier
+            await query.answer("✅ Safe!")
+            
+            keyboard = build_tower_keyboard(game)
+            await safe_edit_message(
+                query,
+                f"✅ <b>Safe! Climbing...</b>\nID: <code>{game_id}</code>\n\n📊 Floor: {new_floor}/9\n💰 Potential: <b>${potential:.2f}</b>\n📈 Multiplier: {multiplier}x",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
 
 
 async def handle_tower_cashout(update: Update, context: ContextTypes.DEFAULT_TYPE, game_id: str, game: dict):
-    """Handle cashout action"""
+    """Handle cashout in Tower game"""
     query = update.callback_query
     user = query.from_user
     
     current_floor = game["current_floor"]
-    difficulty = game["difficulty"]
-    multiplier = TOWER_MULTIPLIERS[difficulty][current_floor]
+    multiplier = TOWER_MULTIPLIERS[game["difficulty"]][current_floor]
     winnings = game["bet_amount"] * multiplier
     
+    # Credit User
     user_wallets[user.id] += winnings
     game["status"] = 'completed'
     game["win"] = True
     game["multiplier"] = multiplier
+    
     increment_user_nonce(user.id)
     update_stats_on_bet(user.id, game_id, game["bet_amount"], True, multiplier=multiplier, context=context)
     update_pnl(user.id)
     save_user_data(user.id)
     
-    # Store provably fair record
-    store_provably_fair_record(game_id, "tower", game["server_seed"], game["client_seed"], game["nonce"], 
-                               result_data=f"Cashed out at floor {current_floor}, Multiplier: {multiplier}x, Config: {game['tower_config']}")
+    store_provably_fair_record(game_id, "tower", game["server_seed"], game["client_seed"], game["nonce"], result_data=f"Cashed out floor {current_floor}")
     
-    # Answer the callback query first
     await query.answer(f"💰 Cashed out ${winnings:.2f}!")
     
-    # Build keyboard showing revealed board
+    # FIX: Explicitly convert tuple to list
     keyboard_markup = build_tower_keyboard(game)
-    # Add provably fair button
-    keyboard = keyboard_markup.inline_keyboard
+    keyboard = list(keyboard_markup.inline_keyboard)
+    
+    replay_row = [
+        InlineKeyboardButton("🔄 Play Again", callback_data=f"tower_again_{game_id}_{user.id}"),
+        InlineKeyboardButton("2️⃣ Double", callback_data=f"tower_double_{game_id}_{user.id}")
+    ]
+    keyboard.append(replay_row)
     keyboard.append([await create_provably_fair_button(game_id, context)])
     
-    await query.edit_message_text(
-        f"💸 <b>Cashed Out!</b>\n"
-        f"ID: <code>{game_id}</code>\n\n"
-        f"🎉 Winnings: <b>${winnings:.2f}</b>\n"
-        f"📈 Multiplier: {multiplier}x\n"
-        f"🏗️ Floors climbed: {current_floor}/9",
+    await safe_edit_message(
+        query,
+        f"💸 <b>Cashed Out!</b>\nID: <code>{game_id}</code>\n\n🎉 <b>Won: ${winnings:.2f}</b>\n📈 Multiplier: {multiplier}x\n🏗️ Reached Floor: {current_floor}",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -11943,8 +11979,39 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 await asyncio.sleep(animation_wait)  # Smart wait based on chat type
                             bot_rolls.append(bot_dice.dice.value)
                         
+                        # Store bot rolls
                         match_data["player_rolls"][p2] = bot_rolls
+                        match_data["bot_rolls"] = bot_rolls
                         p2_rolls = bot_rolls
+                        bot_total = sum(bot_rolls)
+                        
+                        # Calculate Cashout Offer
+                        win_prob, cashout_offer = calculate_pvb_cashout(
+                            bot_total, 
+                            game_rolls, 
+                            match_data['game_type'], 
+                            match_data['game_mode'], 
+                            match_data['bet_amount'], 
+                            0  # Target score unused in simple high/low
+                        )
+                        
+                        # Send Decision Menu
+                        prob_percent = win_prob * 100
+                        keyboard = [
+                            [InlineKeyboardButton(f"💰 Cashout ${cashout_offer:.2f}", callback_data=f"pvb_decision_cashout_{match_id}_{cashout_offer}")],
+                            [InlineKeyboardButton(f"🎲 Roll (Win Prob: {prob_percent:.1f}%)", callback_data=f"pvb_decision_roll_{match_id}")]
+                        ]
+                        
+                        bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
+                        await update.message.reply_text(
+                            f"🤖 Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
+                            f"📊 <b>Win Probability:</b> {prob_percent:.1f}%\n"
+                            f"💰 <b>Cashout Offer:</b> ${cashout_offer:.2f}\n\n"
+                            f"What do you want to do?",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=InlineKeyboardMarkup(keyboard)
+                        )
+                        return  # STOP here, wait for callback
                     
                     if len(p1_rolls) == game_rolls and len(p2_rolls) == game_rolls:
                         # Both players completed, calculate results
@@ -15826,6 +15893,7 @@ def main():
     app.add_handler(game_setup_handler)
     app.add_handler(tower_handler)  # NEW - Tower game conversation
     app.add_handler(pvb_handler)
+    app.add_handler(CallbackQueryHandler(pvb_decision_callback, pattern=r"^pvb_decision_"))  # NEW - PvB cashout decision
     app.add_handler(ai_handler)
     app.add_handler(recovery_handler)
     app.add_handler(withdrawal_address_handler)
@@ -16245,6 +16313,153 @@ async def pvb_who_rolls_first_callback(update: Update, context: ContextTypes.DEF
     await play_vs_bot_game_from_callback(query, context, game_type, target_score)
     context.user_data.clear()
     return ConversationHandler.END
+
+async def pvb_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle User decision: Cashout or Roll"""
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+    
+    # Format: pvb_decision_{action}_{game_id}[_{cashout_offer}]
+    parts = data.split('_')
+    action = parts[2] # 'roll' or 'cashout'
+    game_id = parts[3]
+    
+    # Verify ownership
+    if not check_menu_ownership(query, context):
+        await query.answer("Not your game!", show_alert=True)
+        return
+
+    # Retrieve game from game_sessions
+    match_data = game_sessions.get(game_id)
+    
+    if not match_data or match_data['status'] != 'active':
+        await query.answer("Game expired or finished.", show_alert=True)
+        return
+
+    if action == "cashout":
+        # Execute Cashout - extract amount from callback data
+        try:
+            amount = float(parts[4])
+        except (IndexError, ValueError) as e:
+            logging.error(f"Invalid cashout callback data: {data}, error: {e}")
+            await query.answer("Error processing cashout. Please try again.", show_alert=True)
+            return
+        
+        if amount <= 0:
+            await query.answer("Invalid cashout amount.", show_alert=True)
+            return
+        
+        user_wallets[user.id] += amount
+        match_data['status'] = 'completed'
+        match_data['cashed_out'] = True  # Mark as cashout (not a regular win)
+        
+        update_stats_on_bet(user.id, game_id, match_data['bet_amount'], True, multiplier=(amount/match_data['bet_amount']), context=context)
+        update_pnl(user.id)
+        save_user_data(user.id)
+        
+        # Cleanup
+        if user.id in active_pvb_games: del active_pvb_games[user.id]
+        
+        await safe_edit_message(
+            query,
+            f"💰 <b>Cashed Out!</b>\n\n"
+            f"You took the offer: <b>${amount:.2f}</b>\n"
+            f"Bot Score was: {sum(match_data.get('bot_rolls', []))}\n"
+            f"Game Over.",
+            parse_mode=ParseMode.HTML
+        )
+        
+    elif action == "roll":
+        # User chose to continue - Calculate round result
+        players = match_data['players']
+        p1, p2 = players
+        p1_rolls = match_data["player_rolls"].get(p1, [])
+        p2_rolls = match_data["player_rolls"].get(p2, [])
+        game_mode = match_data['game_mode']
+        
+        # Calculate totals
+        p1_total = sum(p1_rolls)
+        p2_total = sum(p2_rolls)
+        
+        p1_rolls_text = " + ".join(str(r) for r in p1_rolls)
+        p2_rolls_text = " + ".join(str(r) for r in p2_rolls)
+        
+        text = f"<b>Round Results:</b>\n"
+        text += f"{match_data['usernames'][p1]}: {p1_rolls_text} = <b>{p1_total}</b>\n"
+        text += f"{match_data['usernames'][p2]}: {p2_rolls_text} = <b>{p2_total}</b>\n\n"
+        
+        winner_id, extra_info = None, ""
+        
+        # Determine winner based on mode
+        if game_mode == "normal":
+            if p1_total > p2_total:
+                winner_id = p1
+            elif p2_total > p1_total:
+                winner_id = p2
+            else:
+                extra_info = "🤝 It's a tie! No points this round."
+        else:  # Crazy mode
+            if p1_total < p2_total:
+                winner_id = p1
+            elif p2_total < p1_total:
+                winner_id = p2
+            else:
+                extra_info = "🤝 It's a tie! No points this round."
+
+        if winner_id is not None:
+            match_data["points"][winner_id] += 1
+            text += f"🎉 {match_data['usernames'][winner_id]} wins this round!"
+        else:
+            text += extra_info
+
+        text += f"\n\n<b>Score:</b> {match_data['usernames'][p1]} {match_data['points'][p1]} - {match_data['points'][p2]} {match_data['usernames'][p2]}"
+
+        target = match_data["target_points"]
+        final_winner = None
+        if match_data["points"][p1] >= target: final_winner = p1
+        elif match_data["points"][p2] >= target: final_winner = p2
+
+        if final_winner is not None:
+            loser_id = p2 if final_winner == p1 else p1
+            match_data.update({"status": "completed", "winner_id": final_winner})
+            
+            bet_amount = match_data.get("bet_amount_usd", match_data.get("bet_amount", 0))
+            winnings = bet_amount * 1.94
+            
+            # Credit winner (only if not bot)
+            if final_winner != 0:
+                user_wallets[final_winner] += winnings
+                update_stats_on_bet(final_winner, game_id, bet_amount, True, pvp_win=True, multiplier=1.94, context=context)
+                update_pnl(final_winner)
+                save_user_data(final_winner)
+            
+            # Update loser stats (only if not bot)
+            if loser_id != 0:
+                update_stats_on_bet(loser_id, game_id, bet_amount, False, context=context)
+                update_pnl(loser_id)
+                save_user_data(loser_id)
+            
+            text += f"\n\n🏆 <b>{match_data['usernames'][final_winner]} wins the match and earns ${winnings:.2f}!</b>"
+            
+            # Cleanup
+            if user.id in active_pvb_games:
+                del active_pvb_games[user.id]
+        else:
+            # Continue to next round
+            match_data["last_roller"] = None
+            match_data["player_rolls"] = {p1: [], p2: []}
+            
+            allowed_emojis = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
+            gtype = match_data['game_type']
+            text += f"\n\n<b>Next round:</b> {match_data['usernames'][p1]} rolls first! ({allowed_emojis.get(gtype, '🎲')} emoji)"
+
+        await safe_edit_message(
+            query,
+            text,
+            parse_mode=ParseMode.HTML
+        )
+
 
 async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TYPE, game_type: str, target_score: int):
     """Start PvB game from a callback query (used when bot rolls first is selected)"""
