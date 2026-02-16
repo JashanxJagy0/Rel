@@ -4278,6 +4278,15 @@ def set_menu_owner(message, user_id):
 def calculate_pvb_cashout(bot_total, user_rolls_left, game_type, game_mode, bet_amount, target_score):
     """
     Calculates fair cashout based on probability of user winning.
+    
+    Args:
+        bot_total: Total score rolled by the bot
+        user_rolls_left: Number of remaining rolls for the user
+        game_type: Type of game (dice, darts, goal, bowl, etc.)
+        game_mode: Game mode ('normal' for highest wins, 'crazy' for lowest wins)
+        bet_amount: The amount bet on this game
+        target_score: Target score (currently unused, reserved for future extensions)
+    
     Returns: (Win_Probability, Cashout_Amount)
     """
     # 1. Determine Dice Range
@@ -4313,6 +4322,7 @@ def calculate_pvb_cashout(bot_total, user_rolls_left, game_type, game_mode, bet_
     cashout_offer = bet_amount * expected_value_multiplier * 0.95
     
     # Sanity checks
+    # Cap at 95% of 2x to ensure house always has edge (max 1.9x bet_amount)
     if cashout_offer > (bet_amount * 1.9): cashout_offer = bet_amount * 1.9
     if cashout_offer < 0: cashout_offer = 0
     
@@ -11985,9 +11995,6 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             0  # Target score unused in simple high/low
                         )
                         
-                        # Save updated game state (if using save_bot_state function)
-                        # save_bot_state()  # Uncomment if this function exists
-                        
                         # Send Decision Menu
                         prob_percent = win_prob * 100
                         keyboard = [
@@ -16331,12 +16338,21 @@ async def pvb_decision_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if action == "cashout":
-        # Execute Cashout
-        amount = float(parts[4]) if len(parts) > 4 else 0
+        # Execute Cashout - extract amount from callback data
+        try:
+            amount = float(parts[4])
+        except (IndexError, ValueError) as e:
+            logging.error(f"Invalid cashout callback data: {data}, error: {e}")
+            await query.answer("Error processing cashout. Please try again.", show_alert=True)
+            return
+        
+        if amount <= 0:
+            await query.answer("Invalid cashout amount.", show_alert=True)
+            return
         
         user_wallets[user.id] += amount
         match_data['status'] = 'completed'
-        match_data['win'] = True # Technical win for stats
+        match_data['cashed_out'] = True  # Mark as cashout (not a regular win)
         
         update_stats_on_bet(user.id, game_id, match_data['bet_amount'], True, multiplier=(amount/match_data['bet_amount']), context=context)
         update_pnl(user.id)
